@@ -1470,16 +1470,20 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
 }
 
 template <bool partition_kv, LogitsPostHook logits_post_hook, MaskMode mask_mode,
-          PosEncodingMode pos_encoding_mode, uint32_t num_frags_x, uint32_t num_frags_y,
+          PosEncodingMode pos_encoding_mode, uint32_t num_frags_x, uint32_t num_frags_y,  //fragment是指Tensor Core mma中每个线程中要保存的寄存器.  
+          // num_frags_x,num_frags_y,num_frags_z是 mma tensor core中每个线程的m,n,k维度上需要的寄存器数即为num_frags_x,num_frags_y,num_frags_z. 
+          // 在实现的时候n_warps=4即num_warps_x*num_warps_z=5
           uint32_t num_frags_z, uint32_t num_warps_x, uint32_t num_warps_z,
           PageStorage page_storage, QKVLayout kv_layout, typename DTypeIn, typename DTypeQKAccum,
           typename DTypeOut, typename IdType>
-__global__ void BatchPrefillWithPagedKVCacheKernel(
+          // 小trick: 下面有些重复的下标计算可以定义const 局部变量，因为有const folding和const propagation的技巧，所以在编译的时候就会将引用该const 局部变量的地方展开,
+          // 即运行时候该const时就不会保存在寄存器中。
+__global__ void BatchPrefillWithPagedKVCacheKernel( //下面的q是一个batch和n_heads的flash Attention计算过程.那么就需要request_indices,q_tile_indices,kv_tile_indices来定位该request的信息.
     IdType* __restrict__ request_indices, IdType* __restrict__ q_tile_indices,
-    IdType* __restrict__ kv_tile_indices, DTypeIn* __restrict__ q,
-    paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, IdType* __restrict__ q_indptr,
+    IdType* __restrict__ kv_tile_indices, DTypeIn* __restrict__ q, // q就是query
+    paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, IdType* __restrict__ q_indptr, //paged_kv 就是KV cache
     uint8_t* __restrict__ custom_mask, IdType* __restrict__ qk_indptr,
-    IdType* __restrict__ q_offset, IdType* __restrict__ o_indptr, DTypeOut* __restrict__ o,
+    IdType* __restrict__ q_offset, IdType* __restrict__ o_indptr, DTypeOut* __restrict__ o, // o就是attention的结果.
     float* __restrict__ lse, bool* __restrict__ block_valid_mask,
     IdType* __restrict__ kv_chunk_size_ptr, const uint_fastdiv group_size,
     const float logits_soft_cap, float sm_scale, const float log2_rope_rcp_scale,
@@ -1491,18 +1495,18 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
   auto block = cg::this_thread_block();
   const uint32_t kv_chunk_size = *kv_chunk_size_ptr;
 
-  const uint32_t bx = blockIdx.x, lane_idx = threadIdx.x,
+  const uint32_t bx = blockIdx.x, lane_idx = threadIdx.x, //bx是该线程所处的blockIdx.x
                  warp_idx = get_warp_idx<num_warps_x, num_warps_z>(), kv_head_idx = blockIdx.z;
   if (block_valid_mask && !block_valid_mask[bx]) {
     return;
-  }
-  const uint32_t num_kv_heads = gridDim.z, num_qo_heads = num_kv_heads * group_size;
+  } 
+  const uint32_t num_kv_heads = gridDim.z, num_qo_heads = num_kv_heads * group_size;  //num_kv_heads作用就是
   float alibi_slopes[num_frags_x][2];
 
-  const uint32_t request_idx = request_indices[bx], qo_tile_idx = q_tile_indices[bx],
+  const uint32_t request_idx = request_indices[bx], qo_tile_idx = q_tile_indices[bx], //因为推理的时候是一个batch request为单位进行推理,
                  kv_tile_idx = kv_tile_indices[bx];
   constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps_x * 16;
-  const uint32_t qo_len = q_indptr[request_idx + 1] - q_indptr[request_idx],
+  const uint32_t qo_len = q_indptr[request_idx + 1] - q_indptr[request_idx], //为什么叫做qo:因为query和output都有相同的shape.  这里的shape是指n_tokens相同
                  kv_len = (paged_kv.indptr[request_idx + 1] - paged_kv.indptr[request_idx] - 1) *
                               paged_kv.page_size +
                           paged_kv.last_page_len[request_idx];
