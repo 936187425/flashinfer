@@ -1471,7 +1471,7 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
 
 template <bool partition_kv, LogitsPostHook logits_post_hook, MaskMode mask_mode,
           PosEncodingMode pos_encoding_mode, uint32_t num_frags_x, uint32_t num_frags_y,  //fragment是指Tensor Core mma中每个线程中要保存的寄存器.  
-          // num_frags_x,num_frags_y,num_frags_z是 mma tensor core中每个线程的m,n,k维度上需要的寄存器数即为num_frags_x,num_frags_y,num_frags_z. 
+          // num_frags_x,num_frags_y,num_frags_z是 在一个warp tile中 x/y/z轴上mma次数即为num_frags_x,num_frags_y,num_frags_z. 
           // 在实现的时候n_warps=4即num_warps_x*num_warps_z=5
           uint32_t num_frags_z, uint32_t num_warps_x, uint32_t num_warps_z,
           PageStorage page_storage, QKVLayout kv_layout, typename DTypeIn, typename DTypeQKAccum,
@@ -1500,7 +1500,8 @@ __global__ void BatchPrefillWithPagedKVCacheKernel( //下面的q是一个batch�
   if (block_valid_mask && !block_valid_mask[bx]) {
     return;
   } 
-  const uint32_t num_kv_heads = gridDim.z, num_qo_heads = num_kv_heads * group_size;  //num_kv_heads作用就是
+  //num_kv_heads作用就是每个header的计算是独立的,那么且一个sequence的header是连续排列的，因此如果要计算下一个sequence的同样编号的header就要用num_kv_heads作为stride.
+  const uint32_t num_kv_heads = gridDim.z, num_qo_heads = num_kv_heads * group_size;  
   float alibi_slopes[num_frags_x][2];
 
   const uint32_t request_idx = request_indices[bx], qo_tile_idx = q_tile_indices[bx], //因为推理的时候是一个batch request为单位进行推理,
@@ -1522,26 +1523,28 @@ __global__ void BatchPrefillWithPagedKVCacheKernel( //下面的q是一个batch�
 
   extern __shared__ uint8_t smem[];
 
-  DTypeQKAccum s_frag[num_frags_x][num_frags_z][8];
+  //定义了该线程在该warp tile中的寄存器. 该线程在该warp tile中一共有 num_frags_x*num_frags_z的fragments.
+  DTypeQKAccum s_frag[num_frags_x][num_frags_z][8];  
   float o_frag[num_frags_x][num_frags_y][8];
   DTypeQKAccum m[num_frags_x][2];
   float d[num_frags_x][2];
   float rope_freq[num_frags_y / 2][4];
 
+  // q从global memory 到shared memory
   if constexpr (pos_encoding_mode == PosEncodingMode::kRoPELlama) {
     init_rope_freq<num_frags_y>(rope_freq, log2_rope_rcp_scale, log2_rope_rcp_theta);
   }
-  init_states<num_frags_x, num_frags_y>(o_frag, m, d);
+  init_states<num_frags_x, num_frags_y>(o_frag, m, d); //对flashAttention中m(初始值为一个很小的值),d(初始值为1),o_frag进行初始化.
 
   const uint32_t qo_packed_idx_base =
       (qo_tile_idx * num_warps_x + get_warp_idx_x<num_warps_x, num_warps_z>()) * num_frags_x * 16;
   const uint32_t qo_n_stride = get_n_stride_impl<QKVLayout::kNHD, head_dim>(num_qo_heads),
                  qo_h_stride = get_h_stride_impl<QKVLayout::kNHD, head_dim>(qo_len);
-  smem_t qo_smem(smem);
+  smem_t qo_smem(smem); //dynamic shared memory 
   DTypeIn* q_ptr_base =
       q + get_elem_offset_impl<QKVLayout::kNHD, head_dim>(
               q_indptr[request_idx], kv_head_idx * group_size,
-              (lane_idx % 8) * num_elems_per_128b<DTypeIn>(), qo_len, num_qo_heads);
+              (lane_idx % 8) * num_elems_per_128b<DTypeIn>(), qo_len, num_qo_heads); //计算出该warp需要load q的数据的base ptr.
   DTypeIn* o_ptr_base =
       partition_kv ? o + kv_tile_idx * num_qo_heads * head_dim +
                          get_elem_offset_impl<QKVLayout::kNHD, head_dim>(
@@ -1549,17 +1552,18 @@ __global__ void BatchPrefillWithPagedKVCacheKernel( //下面的q是一个batch�
                              (lane_idx % 8) * num_elems_per_128b<DTypeOut>(), qo_len, num_qo_heads)
                    : o + get_elem_offset_impl<QKVLayout::kNHD, head_dim>(
                              o_indptr[request_idx], kv_head_idx * group_size,
-                             (lane_idx % 8) * num_elems_per_128b<DTypeOut>(), qo_len, num_qo_heads);
+                             (lane_idx % 8) * num_elems_per_128b<DTypeOut>(), qo_len, num_qo_heads); //这个与q_ptr_base的计算方式是相同的,因为q和o的size是一样的。
   uint32_t q_smem_offset_r = smem_t::get_permuted_offset<channel_size_128b_in>(
       get_warp_idx_x<num_warps_x, num_warps_z>() * num_frags_x * 16 + lane_idx % 16, lane_idx / 16);
 
   load_q_global_smem<num_warps_x, num_warps_z, num_frags_x, num_frags_y>(
       qo_packed_idx_base, qo_upper_bound, q_ptr_base, qo_n_stride, qo_h_stride, group_size,
-      &qo_smem);
+      &qo_smem); //从global ->shared 的指令
 
   cp_async::commit_group();
-  cp_async::wait_group<0>();
-  block.sync();
+  cp_async::wait_group<0>(); //warp level的数据拷贝同步,因为我们上面用的cp是async的.
+  block.sync();  //获得Thread Block的 Cooperative Groups,当对shared memory write后，再access，则需要一个__syncthreads();
+  
 
   if constexpr (pos_encoding_mode == PosEncodingMode::kRoPELlama) {
     if (q_offset == nullptr) {
@@ -1593,7 +1597,7 @@ __global__ void BatchPrefillWithPagedKVCacheKernel( //下面的q是一个batch�
 
   smem_t k_smem(smem + (num_warps_x * num_frags_x) * 16 * head_dim * sizeof(DTypeIn)),
       v_smem(smem + (num_warps_x * num_frags_x + num_warps_z * num_frags_z) * 16 * head_dim *
-                        sizeof(DTypeIn));
+                        sizeof(DTypeIn)); //定义k的shared memory
 
   uint32_t k_smem_offset_r = smem_t::get_permuted_offset<channel_size_128b_in>(
                get_warp_idx_z<num_warps_x, num_warps_z>() * num_frags_z * 16 + 8 * (lane_idx / 16) +
@@ -1609,14 +1613,14 @@ __global__ void BatchPrefillWithPagedKVCacheKernel( //下面的q是一个batch�
   uint32_t packed_page_iter_base = paged_kv.indptr[request_idx] * paged_kv.page_size + chunk_start;
   page_produce_kv<false, num_warps_x, num_warps_z, num_frags_y, num_frags_z>(
       k_smem, &kv_smem_offset_w, paged_kv, chunk_start, packed_page_iter_base, chunk_end,
-      last_indptr);
+      last_indptr); //k的 global memory->shared memory. produce是为适配 sm90的produce comsume的概念.
   cp_async::commit_group();
   page_produce_kv<true, num_warps_x, num_warps_z, num_frags_y, num_frags_z>(
       v_smem, &kv_smem_offset_w, paged_kv, chunk_start, packed_page_iter_base, chunk_end,
-      last_indptr);
+      last_indptr); //v的 global memory->shared memory.
   cp_async::commit_group();
 
-  const uint32_t num_iterations =
+  const uint32_t num_iterations = //计算出qk计算过程中多少个iterations,才能算完qk结果的整行.
       ceil_div((mask_mode == MaskMode::kCausal
                     ? min(chunk_end - chunk_start,
                           sub_if_greater_or_zero(
@@ -1635,7 +1639,7 @@ __global__ void BatchPrefillWithPagedKVCacheKernel( //下面的q是一个batch�
 
 #pragma unroll
   for (uint32_t iter = 0; iter < num_iterations; ++iter) {
-    cp_async::wait_group<1>();
+    cp_async::wait_group<1>(); //阻塞直到k 从global memory到shared memory
     block.sync();
 
     if constexpr (pos_encoding_mode == PosEncodingMode::kRoPELlama) {
