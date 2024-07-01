@@ -211,7 +211,7 @@ template <LogitsPostHook logits_post_hook, QKVLayout kv_layout, bool partition_k
           PosEncodingMode pos_encoding_mode, uint32_t num_stages_smem, uint32_t tile_size_per_bdx,
           uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename DTypeQ, 
           typename DTypeKV, typename DTypeOut>
-__global__ void SingleDecodeWithKVCacheKernel(DTypeQ* __restrict__ q, DTypeKV* __restrict__ k,
+__global__ void SingleDecodeWithKVCacheKernel(DTypeQ* __restrict__ q, DTypeKV* __restrict__ k, //这个是decode
                                               DTypeKV* __restrict__ v, DTypeOut* __restrict__ o,
                                               float* __restrict__ lse,
                                               tensor_info_t<kv_layout, bdx * vec_size> info,
@@ -264,7 +264,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeQ* __restrict__ q, DTypeKV* _
   }
   block.sync(); //上面是rope位置编码.
 
-  uint32_t chunk_start = kv_chunk_idx * kv_chunk_size;
+  uint32_t chunk_start = kv_chunk_idx * kv_chunk_size; //kv_chunk_size=1
   kv_chunk_size = min(kv_chunk_size, seq_len - chunk_start);
   uint32_t chunk_end = chunk_start + kv_chunk_size;
 
@@ -689,21 +689,23 @@ cudaError_t SingleDecodeWithKVCacheDispatched(DTypeQ* q, DTypeKV* k, DTypeKV* v,
       int num_blocks_per_sm = 0;
       int num_sm = 0;
       int dev_id = 0;
-      FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
-      FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
+      FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id)); //判断是否有device id
+      FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));  //这个是高效的获取device 属性的API. From:https://developer.nvidia.com/blog/cuda-pro-tip-the-fast-way-to-query-device-properties/
       FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel,
-                                                                         num_threads, smem_size));
-      uint32_t max_grid_size = uint32_t(num_blocks_per_sm) * uint32_t(num_sm);
-      uint32_t max_num_kv_chunks = max_grid_size / num_kv_heads;
-      uint32_t kv_chunk_size = max(ceil_div(seq_len, max_num_kv_chunks), 256);
+                                                                         num_threads, smem_size)); 
+                                                                         //计算一个sm中最多可以贮存多少active blocks by  cudaOccupancyMaxActiveBlocksPerMultiprocessor
+                                                                         // https://developer.nvidia.com/blog/cuda-pro-tip-occupancy-api-simplifies-launch-configuration/
+      uint32_t max_grid_size = uint32_t(num_blocks_per_sm) * uint32_t(num_sm);//每个sm中active blocks数
+      uint32_t max_num_kv_chunks = max_grid_size / num_kv_heads;//即每个kv_heads可以使用的block数
+      uint32_t kv_chunk_size = max(ceil_div(seq_len, max_num_kv_chunks), 256); //seq_len表示的一个seq中的tokens,即该seq下需要使用多少
       uint32_t num_chunks = ceil_div(seq_len, kv_chunk_size);
-      dim3 nblks = dim3(num_chunks, num_kv_heads);
+      dim3 nblks = dim3(num_chunks, num_kv_heads); //grid size : num_chunks=seq_len/seq_len/max_grid_size/n_kv_heads.= max_grid_size/n_kv_heads即一个kv_head可以同时处理几个q head.
       if (nblks.x == 0 || nblks.y == 0) {
         std::ostringstream err_msg;
         err_msg << "Invalid kernel configuration: nblks=(" << nblks.x << "," << nblks.y << ")";
         throw std::runtime_error(err_msg.str());
       }
-      dim3 nthrs = dim3(bdx, bdy, bdz);
+      dim3 nthrs = dim3(bdx, bdy, bdz); //block size (warp_size,group_size,每个kv_head在一个周期里可以同时处理几个qk计算)
       float* tmp_lse = (float*)(tmp + num_chunks * num_qo_heads * HEAD_DIM);
       void* args[] = {(void*)&q,
                       (void*)&k,
