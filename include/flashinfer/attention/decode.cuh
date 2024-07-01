@@ -238,8 +238,8 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeQ* __restrict__ q, DTypeKV* _
                                           sizeof(DTypeKV)); //v cache在shared memory中的base ptr,
   float* smem_md = (float*)(smem + 2 * num_stages_smem * bdy * tile_size_per_bdx * bdz * head_dim *
                                        sizeof(DTypeKV));
-
-  uint32_t tx = threadIdx.x, ty = threadIdx.y, tz = threadIdx.z;
+  //这下面定义的是寄存器的值
+  uint32_t tx = threadIdx.x, ty = threadIdx.y, tz = threadIdx.z; //tx对应的是lane id,ty对应的是group id,tz对应的replication id.
   vec_t<float, vec_size> q_vec;
   vec_t<float, vec_size> freq;
   if constexpr (pos_encoding_mode == PosEncodingMode::kRoPELlama) {
@@ -254,6 +254,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeQ* __restrict__ q, DTypeKV* _
                                                 freq, seq_len - 1);
   } else {
     // do not apply rotary embedding to q matrix
+    // q_vec是直接从global memory到register.因为这个数据不需要进行修改,只有这个数据需要被换入换出的时候，才需要把数据从global memory->shared memory. 实现data reuse.
     q_vec.cast_load(q + info.get_qo_elem_offset(0, qo_head_idx, tx * vec_size));
   }
   // multiple q_vec by sm_scale
@@ -261,7 +262,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeQ* __restrict__ q, DTypeKV* _
   for (uint32_t i = 0; i < vec_size; ++i) {
     q_vec[i] *= sm_scale;
   }
-  block.sync();
+  block.sync(); //上面是rope位置编码.
 
   uint32_t chunk_start = kv_chunk_idx * kv_chunk_size;
   kv_chunk_size = min(kv_chunk_size, seq_len - chunk_start);
@@ -635,22 +636,23 @@ cudaError_t SingleDecodeWithKVCacheDispatched(DTypeQ* q, DTypeKV* k, DTypeKV* v,
                                               float logits_soft_cap, float sm_scale,
                                               float rope_scale, float rope_theta,
                                               cudaStream_t stream) {
+  // grid(1,n_kv_heads),block(bdx,bdy(group_size),bdz) bdx实际上就是warp_size,group_size表明一个kv head被group_size个q heads共享.
   const float rope_rcp_scale = 1.f / rope_scale;
   const float rope_rcp_theta = 1.f / rope_theta;
-  constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeKV), HEAD_DIM / 32UL);
-  constexpr uint32_t num_stages_smem = 2U;
-  constexpr uint32_t bdx = HEAD_DIM / vec_size;
+  constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeKV), HEAD_DIM / 32UL); //vec_size在qk计算时每个thread负责的部分向量计算的元素数
+  constexpr uint32_t num_stages_smem = 2U; //预取数据的周期数+1
+  constexpr uint32_t bdx = HEAD_DIM / vec_size; //一般是指32即warp_size
   static_assert(bdx <= 32U);
-  DISPATCH_GQA_GROUP_SIZE(num_qo_heads / num_kv_heads, GROUP_SIZE, {
+  DISPATCH_GQA_GROUP_SIZE(num_qo_heads / num_kv_heads, GROUP_SIZE, { //计算GQA的flashAttention
     constexpr uint32_t bdy = GROUP_SIZE;
-    constexpr uint32_t num_threads =
+    constexpr uint32_t num_threads = //用get_heuristic_num_threads的方法来预测下一个block中有多少threads是合理的.
         std::max(get_heuristic_num_threads(GROUP_SIZE, sizeof(DTypeKV)), bdx * bdy);
-    constexpr uint32_t bdz = num_threads / (bdx * bdy);
+    constexpr uint32_t bdz = num_threads / (bdx * bdy); //即bdz表示一个qk head在一个周期里同时进行bdz个k.
     tensor_info_t<KV_LAYOUT, HEAD_DIM> info(1, seq_len, num_qo_heads, num_kv_heads);
-    constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? (sizeof(DTypeKV) == 1 ? 2U : 8U) : 1U;
-    const uint32_t smem_size =
-        2U * num_stages_smem * bdy * tile_size_per_bdx * bdz * HEAD_DIM * sizeof(DTypeKV) +
-        2U * bdy * bdz * sizeof(float);
+    constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? (sizeof(DTypeKV) == 1 ? 2U : 8U) : 1U; //后续的所有代码假设tile_size_per_bdx=1即group size!=1.
+    const uint32_t smem_size = 
+        2U * num_stages_smem * bdy * tile_size_per_bdx * bdz * HEAD_DIM * sizeof(DTypeKV) + //这里的2是k smem和v smem
+        2U * bdy * bdz * sizeof(float); //这里的2是m和d. 因为对于decode阶段的GQA,一个warp只会有一个m和d的值(bdy和bdz表示有多少warp).
     if (seq_len <= 256 || tmp == nullptr) {
       // no need to use partition-kv kernel
       auto kernel =

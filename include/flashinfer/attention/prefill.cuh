@@ -1650,7 +1650,7 @@ __global__ void BatchPrefillWithPagedKVCacheKernel( //下面的q是一个batch�
       block.sync();
     }
 
-    // compute attention score
+    // TODO: compute attention score 这个是计算qk的逻辑 
     compute_qk<logits_post_hook, num_frags_x, num_frags_y, num_frags_z, DTypeIn>(
         &qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag, logits_soft_cap);
 
@@ -1689,10 +1689,10 @@ __global__ void BatchPrefillWithPagedKVCacheKernel( //下面的q是一个batch�
         chunk_start + (iter + 1) * 16 * num_warps_z * num_frags_z, packed_page_iter_base, chunk_end,
         last_indptr);
     cp_async::commit_group();
-    cp_async::wait_group<1>();
+    cp_async::wait_group<1>(); //阻塞等候V cache从global memory ->shared memory
     block.sync();
 
-    // compute sfm*v
+    // compute sfm*v 
     compute_sfm_v<num_frags_x, num_frags_y, num_frags_z, DTypeIn>(&v_smem, &v_smem_offset_r, s_frag,
                                                                   o_frag, d);
 
@@ -1703,6 +1703,7 @@ __global__ void BatchPrefillWithPagedKVCacheKernel( //下面的q是一个batch�
         last_indptr);
     cp_async::commit_group();
   }
+  // 迭代的num_inter
   cp_async::wait_group<0>();
   block.sync();
 
