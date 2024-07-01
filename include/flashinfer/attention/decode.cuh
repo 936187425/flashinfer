@@ -209,32 +209,33 @@ __device__ __forceinline__ void sync_state(state_t<vec_size>& st, float* smem, f
  */
 template <LogitsPostHook logits_post_hook, QKVLayout kv_layout, bool partition_kv,
           PosEncodingMode pos_encoding_mode, uint32_t num_stages_smem, uint32_t tile_size_per_bdx,
-          uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename DTypeQ,
+          uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename DTypeQ, 
           typename DTypeKV, typename DTypeOut>
 __global__ void SingleDecodeWithKVCacheKernel(DTypeQ* __restrict__ q, DTypeKV* __restrict__ k,
                                               DTypeKV* __restrict__ v, DTypeOut* __restrict__ o,
                                               float* __restrict__ lse,
                                               tensor_info_t<kv_layout, bdx * vec_size> info,
-                                              float logits_soft_cap, float sm_scale,
+                                              float logits_soft_cap, float sm_scale,_
                                               float rope_rcp_scale, float rope_rcp_theta,
                                               uint32_t kv_chunk_size) {
   auto block = cg::this_thread_block();
-  auto grid = cg::this_grid();
+  auto grid = cg::this_grid(); //利用cuda 9.0之后cooperative group的概念,可以获取该线程所在的block和grid的抽象封装,并提供了block和grid层面的sync.
   sm_scale *=
       (logits_post_hook == LogitsPostHook::kNone ? math::log2e : math::ptx_rcp(logits_soft_cap));
-
-  constexpr uint32_t head_dim = bdx * vec_size;
-  uint32_t kv_head_idx = blockIdx.y;
-  uint32_t qo_head_idx = kv_head_idx * bdy + threadIdx.y;
-  uint32_t kv_chunk_idx = blockIdx.x;
-  uint32_t num_qo_heads = info.num_qo_heads;
+  // 我们必须要记住 grid(q_len,n_kv_head),block(32,group_size,k)及其对应的slide. 在这份代码中q_len=1. 32是一个warp的线程数.
+  // this code bdx=32,bdy=group_size=n_head/n_kv_head,bdz=k.
+  constexpr uint32_t head_dim = bdx * vec_size; //每个head_dim会进行划分，即分配给一个warp中的每个thread.即vec_size=head_dim/bdx.
+  uint32_t kv_head_idx = blockIdx.y; //表示该线程处于的kv head id号
+  uint32_t qo_head_idx = kv_head_idx * bdy + threadIdx.y; //表示该线程要处理的q head id号. 每个kv_head的stride 为group size即bdy.
+  uint32_t kv_chunk_idx = blockIdx.x; // kv_chunk_idx就是q_len,在这个例子可以当作1.
+  uint32_t num_qo_heads = info.num_qo_heads; //qo_heads的q和o的头.
   const float alibi_slope = get_alibi_slope(qo_head_idx, num_qo_heads) * math::log2e;
-  uint32_t seq_len = info.kv_len;
+  uint32_t seq_len = info.kv_len; //kv cache中的长度.
 
-  extern __shared__ uint8_t smem[];
-  DTypeKV* k_smem = (DTypeKV*)smem;
+  extern __shared__ uint8_t smem[]; //dynamic shared memory,这个shared memory size是通过kernel<<<>>>传入的.
+  DTypeKV* k_smem = (DTypeKV*)smem; 
   DTypeKV* v_smem = (DTypeKV*)(smem + num_stages_smem * bdy * tile_size_per_bdx * bdz * head_dim *
-                                          sizeof(DTypeKV));
+                                          sizeof(DTypeKV)); //v cache在shared memory中的base ptr,
   float* smem_md = (float*)(smem + 2 * num_stages_smem * bdy * tile_size_per_bdx * bdz * head_dim *
                                        sizeof(DTypeKV));
 
