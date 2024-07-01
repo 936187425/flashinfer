@@ -222,7 +222,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeQ* __restrict__ q, DTypeKV* _
   auto grid = cg::this_grid(); //利用cuda 9.0之后cooperative group的概念,可以获取该线程所在的block和grid的抽象封装,并提供了block和grid层面的sync.
   sm_scale *=
       (logits_post_hook == LogitsPostHook::kNone ? math::log2e : math::ptx_rcp(logits_soft_cap));
-  // 我们必须要记住 grid(q_len,n_kv_head),block(32,group_size,k)及其对应的slide. 在这份代码中q_len=1. 32是一个warp的线程数.
+  // 我们必须要记住 grid(num_chunks,n_kv_head),block(32,group_size,bdz)及其对应的slide. 在这份代码中q_len=1. 32是一个warp的线程数.
   // this code bdx=32,bdy=group_size=n_head/n_kv_head,bdz=k.
   constexpr uint32_t head_dim = bdx * vec_size; //每个head_dim会进行划分，即分配给一个warp中的每个thread.即vec_size=head_dim/bdx.
   uint32_t kv_head_idx = blockIdx.y; //表示该线程处于的kv head id号
@@ -266,7 +266,11 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeQ* __restrict__ q, DTypeKV* _
 
   uint32_t chunk_start = kv_chunk_idx * kv_chunk_size; //kv_chunk_size=1
   kv_chunk_size = min(kv_chunk_size, seq_len - chunk_start);
-  uint32_t chunk_end = chunk_start + kv_chunk_size;
+  uint32_t chunk_end = chunk_start + kv_chunk_size; 
+  // grid size(num_chunk,n_kv_head)
+  // 针对kv_head_idx=0时:
+  // seq_len: 0 1 2 3 4 ... kv_chunk_size-1 | kv_chunk_size kv_chunk_size+1 ..... 2*kv_chunk_size-1| ...| ..
+  // 对应的Block: blockIdx.x=0,blockIdx.y=0  | blockIdx.x=1,blockIdx.y=0                            |    | blockIdx.x=num_chunks-1,blockIdx.y=0
 
   // preload k tiles and v tiles
   uint32_t producer_kv_idx_base = chunk_start;
@@ -636,7 +640,8 @@ cudaError_t SingleDecodeWithKVCacheDispatched(DTypeQ* q, DTypeKV* k, DTypeKV* v,
                                               float logits_soft_cap, float sm_scale,
                                               float rope_scale, float rope_theta,
                                               cudaStream_t stream) {
-  // grid(1,n_kv_heads),block(bdx,bdy(group_size),bdz) bdx实际上就是warp_size,group_size表明一个kv head被group_size个q heads共享.
+  // grid(num_chunk,n_kv_heads),block(bdx,bdy(group_size),bdz) bdx实际上就是warp_size,group_size表明一个kv head被group_size个q heads共享.
+  // 因为在single request decode阶段,num_chunk=ceil(1 token/n_kv_head)=1.
   const float rope_rcp_scale = 1.f / rope_scale;
   const float rope_rcp_theta = 1.f / rope_theta;
   constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeKV), HEAD_DIM / 32UL); //vec_size在qk计算时每个thread负责的部分向量计算的元素数
