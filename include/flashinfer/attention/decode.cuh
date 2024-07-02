@@ -70,17 +70,19 @@ namespace {
  * \param st The self-attention state to be updated
  */
 template <LogitsPostHook logits_post_hook, PosEncodingMode pos_encoding_mode, uint32_t vec_size,
-          uint32_t bdx, uint32_t tile_size, typename T>
+          uint32_t bdx, uint32_t tile_size, typename T> //tile_size=tile_size_per_bdx*bdy. (bdy是group size)
 __device__ __forceinline__ void compute_qk(const T* smem, uint32_t compute_stage_idx,
                                            const vec_t<float, vec_size>& q_vec,
                                            const vec_t<float, vec_size>& freq, uint32_t kv_idx_base,
                                            uint32_t iter_base, uint32_t iter_bound,
                                            const int32_t q_offset, float alibi_slope, float* s,
                                            state_t<vec_size>& st, const float logits_soft_cap) {
-  uint32_t tx = threadIdx.x, tz = threadIdx.z;
-  float m_prev = st.m;
+  uint32_t tx = threadIdx.x, tz = threadIdx.z; // tx:lane_id; tz:replication id 
+  float m_prev = st.m; 
+// q: q_vec , k: smem[0:vec_size]
 #pragma unroll
-  for (uint32_t j = 0; j < tile_size; ++j) {
+  for (uint32_t j = 0; j < tile_size; ++j) {   //TODO: tile_size_per_bdx*bdy(其实一个warp会去计算) TODO:这里为什么是tile_size_per_bdx*bdy而不是tile_size_per_bdx？
+                                               //我感觉这里是一个bug,
     vec_t<float, vec_size> k_vec;
     if constexpr (pos_encoding_mode == PosEncodingMode::kRoPELlama) {
       // apply rotary embedding for all rows in k matrix of kv-cache
@@ -88,31 +90,32 @@ __device__ __forceinline__ void compute_qk(const T* smem, uint32_t compute_stage
                                                   kv_idx_base + tz * tile_size + j);
     } else {
       // do not apply rotary embedding
+      
       k_vec.cast_load(smem + (j * bdx + tx) * vec_size);
     }
-    s[j] = 0.f;
+    s[j] = 0.f; //qk的向量得分,是一个scalar.
 #pragma unroll
     for (uint32_t i = 0; i < vec_size; ++i) {
-      s[j] += q_vec[i] * k_vec[i];
+      s[j] += q_vec[i] * k_vec[i]; //这个是用CUDA Core计算的两个向量乘积的写法
     }
 #pragma unroll
     for (uint32_t offset = bdx / 2; offset > 0; offset /= 2) {
       s[j] += math::shfl_xor_sync(s[j], offset);
-    }
+    }//math::shfl_xor_sync是一个warp level primitives,即把一个warp中传入的寄存器s[j]进行求最大值，并把一个warp中的最大值返回给s[j]寄存器中.
     s[j] = (iter_base + tz * tile_size + j < iter_bound) ? s[j] : -5e4;
     s[j] = apply_logits_post_hook<logits_post_hook>(s[j], logits_soft_cap);
     if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
       s[j] += alibi_slope * float(int(kv_idx_base + tz * tile_size + j) - q_offset);
     }
-    st.m = max(st.m, s[j]);
-  }
+    st.m = max(st.m, s[j]); 
+  }//此时就计算出一个q与tile_size个k token向量乘结果的最大值.
 
   float o_scale = math::ptx_exp2(m_prev - st.m);
-  st.d *= o_scale;
+  st.d *= o_scale; 
 #pragma unroll
   for (uint32_t j = 0; j < tile_size; ++j) {
     s[j] = math::ptx_exp2(s[j] - st.m);
-    st.d += s[j];
+    st.d += s[j]; //更新st.d:一共有两部,更新之前算的d(即line:111),然后再加上现在算的.
   }
 #pragma unroll
   for (uint32_t i = 0; i < vec_size; ++i) {
@@ -222,22 +225,29 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeQ* __restrict__ q, DTypeKV* _
   auto grid = cg::this_grid(); //利用cuda 9.0之后cooperative group的概念,可以获取该线程所在的block和grid的抽象封装,并提供了block和grid层面的sync.
   sm_scale *=
       (logits_post_hook == LogitsPostHook::kNone ? math::log2e : math::ptx_rcp(logits_soft_cap));
-  // 我们必须要记住 grid(num_chunks,n_kv_head),block(32,group_size,bdz)及其对应的slide. 在这份代码中q_len=1. 32是一个warp的线程数.
+  // 我们必须要记住 grid(num_chunks,n_kv_head),block(32,group_size,bdz)及其对应的slide. 在这份代码中num_chunks=1. 32是一个warp的线程数.
   // this code bdx=32,bdy=group_size=n_head/n_kv_head,bdz=k.
   constexpr uint32_t head_dim = bdx * vec_size; //每个head_dim会进行划分，即分配给一个warp中的每个thread.即vec_size=head_dim/bdx.
   uint32_t kv_head_idx = blockIdx.y; //表示该线程处于的kv head id号
   uint32_t qo_head_idx = kv_head_idx * bdy + threadIdx.y; //表示该线程要处理的q head id号. 每个kv_head的stride 为group size即bdy.
+  /*
+  * kv_head_idx和qo_head_idx的关系:假设有2个kv head,4个qo head, group_size= n_head/n_kv_head=2
+  * qo head idx:    0 1  | 2 3
+  * 对应的kv head idx: 0 | 1
+  * 因此如何通过kv_head_idx计算qo_ head_idx= kv_head_idx*group_size+threadIdx.y【在这个kv head里的group id】
+  */
   uint32_t kv_chunk_idx = blockIdx.x; // kv_chunk_idx就是q_len,在这个例子可以当作1.
   uint32_t num_qo_heads = info.num_qo_heads; //qo_heads的q和o的头.
   const float alibi_slope = get_alibi_slope(qo_head_idx, num_qo_heads) * math::log2e;
   uint32_t seq_len = info.kv_len; //kv cache中的长度.
 
   extern __shared__ uint8_t smem[]; //dynamic shared memory,这个shared memory size是通过kernel<<<>>>传入的.
+  // uint8_t ksmem+v_smem[2][num_stages_smem][num_replication][group_size][tile_size_per_bdx][warp_size] tile_size_per_bdx=1,2是ksmem和vsmem
   DTypeKV* k_smem = (DTypeKV*)smem; 
-  DTypeKV* v_smem = (DTypeKV*)(smem + num_stages_smem * bdy * tile_size_per_bdx * bdz * head_dim *
+  DTypeKV* v_smem = (DTypeKV*)(smem + num_stages_smem * bdy * tile_size_per_bdx * bdz * head_dim * //这个可以看出,每个q head都会分配一个k v shared memory空间，但是实际上是会造成空间上的浪费. 
                                           sizeof(DTypeKV)); //v cache在shared memory中的base ptr,
   float* smem_md = (float*)(smem + 2 * num_stages_smem * bdy * tile_size_per_bdx * bdz * head_dim *
-                                       sizeof(DTypeKV));
+                                       sizeof(DTypeKV)); 
   //这下面定义的是寄存器的值
   uint32_t tx = threadIdx.x, ty = threadIdx.y, tz = threadIdx.z; //tx对应的是lane id,ty对应的是group id,tz对应的replication id.
   vec_t<float, vec_size> q_vec;
@@ -252,17 +262,20 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeQ* __restrict__ q, DTypeKV* _
     // apply rotary embedding to q matrix
     q_vec = vec_apply_llama_rope<vec_size, bdx>(q + info.get_qo_elem_offset(0, qo_head_idx, 0),
                                                 freq, seq_len - 1);
+    //上面是rope位置编码相关的逻辑,暂时还没有去细扣
   } else {
     // do not apply rotary embedding to q matrix
-    // q_vec是直接从global memory到register.因为这个数据不需要进行修改,只有这个数据需要被换入换出的时候，才需要把数据从global memory->shared memory. 实现data reuse.
-    q_vec.cast_load(q + info.get_qo_elem_offset(0, qo_head_idx, tx * vec_size));
+    // q_vec是直接从global memory到register的考量:
+    //1. 当一个寄存器的数据需要从寄存器多次换入和换出时，则需要把数据从global memory先copy到shared memory作为一个cache。但是如果没有多次换入换出，直接从global memory到寄存器更合适。
+    //2. 这个kernel是在single request decode阶段，那么seq只有一个token,那么每个thread申请的寄存器是少量的.
+    q_vec.cast_load(q + info.get_qo_elem_offset(0, qo_head_idx, tx * vec_size));//tx:lane id
   }
   // multiple q_vec by sm_scale
 #pragma unroll
   for (uint32_t i = 0; i < vec_size; ++i) {
     q_vec[i] *= sm_scale;
   }
-  block.sync(); //上面是rope位置编码.
+  block.sync(); 
 
   uint32_t chunk_start = kv_chunk_idx * kv_chunk_size; //kv_chunk_size=1
   kv_chunk_size = min(kv_chunk_size, seq_len - chunk_start);
@@ -275,12 +288,15 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeQ* __restrict__ q, DTypeKV* _
   // preload k tiles and v tiles
   uint32_t producer_kv_idx_base = chunk_start;
   constexpr uint32_t vec_bits = sizeof(DTypeKV) * vec_size * 8;
-#pragma unroll
-  for (uint32_t iter = 0; iter < num_stages_smem; ++iter) {
+  
+  //把第一个周期计算需要的kv数据以及第二个周期计算需要的kv数据从cp async global memory->shared memory. 
+#pragma unroll 
+  for (uint32_t iter = 0; iter < num_stages_smem; ++iter) { //num_stages_smem:预取的次数
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
-      cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
-          k_smem + (((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
-              tx * vec_size,
+      cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>( 
+          k_smem + (((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim + 
+          // k_smem[num_stage_smem][num_replication][group_size][tile_size_per_bdx][warp_size]
+              tx * vec_size, // iter,tz,ty,j,tx是变量.  PrefetchMode::kPrefetch 模式会读取的数据基础上再额外读取128B.
           k + info.get_kv_elem_offset(
                   producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j, kv_head_idx,
                   tx * vec_size),
@@ -299,33 +315,39 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeQ* __restrict__ q, DTypeKV* _
     cp_async::commit_group();
     producer_kv_idx_base += bdy * bdz * tile_size_per_bdx;
   }
+  //上述会有2*num_stages_smem commit_group 即 k1,v1,k2,v2,....k_{num_stages_smem},v_{num_stages_smem}
 
   // pipelining k/v tiles loading and state updating
   uint32_t consumer_kv_idx_base = chunk_start, stage_idx = 0;
   state_t<vec_size> st_local;
-  float s[bdy * tile_size_per_bdx];
+  float s[bdy * tile_size_per_bdx]; //bdy=group size
 
+//flash attention 计算的迭代.
 #pragma unroll 2
-  for (uint32_t iter = 0; iter < ceil_div(kv_chunk_size, tile_size_per_bdx * bdy * bdz); ++iter) {
+  for (uint32_t iter = 0; iter < ceil_div(kv_chunk_size, tile_size_per_bdx * bdy * bdz); ++iter) { //kv_chunk_size的tokens数
     // compute qk
-    cp_async::wait_group<2 * num_stages_smem - 1>();
+    cp_async::wait_group<2 * num_stages_smem - 1>(); 
+    //2*num_stages_smem-1 表示最多只有2*num_stages_smem-1个cp异步事务未完成.即保证了line 305 中k1从global memory到shared memory的异步事务一定完成.
+    // 在计算qk时，需要保证q,k已经到达shared memory或register中,因此需要用line 316保证k1的到达,q已经在line 259中已经到达了.
     block.sync();
-    compute_qk<logits_post_hook, pos_encoding_mode, vec_size, bdx, bdy * tile_size_per_bdx>(
-        k_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, stage_idx, q_vec,
+    compute_qk<logits_post_hook, pos_encoding_mode, vec_size, bdx, bdy * tile_size_per_bdx>( //tile_size_per_bdx=1
+        k_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, stage_idx, q_vec, //k_smem [stage_idx][tz][...]
         freq, consumer_kv_idx_base, iter * bdy * tile_size_per_bdx * bdz, kv_chunk_size,
         seq_len - 1, alibi_slope, s, st_local, logits_soft_cap);
     block.sync();
     // load k
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
       cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
-          k_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
+          k_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim + //Very Interesting! 此处采用的是stage_idx原因是这个周期的数据计算完了，说明没有用了，那么in-place copy新的数据即可
               tx * vec_size,
           k + info.get_kv_elem_offset(
                   producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j, kv_head_idx,
                   tx * vec_size),
           producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j < chunk_end);
     }
-    cp_async::commit_group();
+    cp_async::commit_group(); 
+    //line317-line336:线程会先cp.wait_group等候这个周期里的数据到达shared memory的相应位置，然后再把下一个周期计算的数据用异步cp拷贝，之后再开始该周期的计算
+    // 【这份代码的逻辑是:先计算该周期的计算，然后拷贝下一个周期的计算数据】.
 
     // update m/d/o state
     cp_async::wait_group<2 * num_stages_smem - 1>();
@@ -336,7 +358,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeQ* __restrict__ q, DTypeKV* _
     block.sync();
 
     // load v
-    for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
+    for (uint32_t j = 0; j < tile_size_per_bdx; ++j) { 
       cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
           v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
               tx * vec_size,
