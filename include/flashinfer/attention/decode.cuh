@@ -140,14 +140,14 @@ template <uint32_t vec_size, uint32_t bdx, uint32_t tile_size, typename T>
 __device__ __forceinline__ void update_local_state(const T* smem, const float* s,
                                                    uint32_t compute_stage_idx,
                                                    state_t<vec_size>& st) {
-  uint32_t tx = threadIdx.x;
+  uint32_t tx = threadIdx.x; //tx: lane id
 #pragma unroll
   for (uint32_t j = 0; j < tile_size; ++j) {
     vec_t<float, vec_size> v_vec;
-    v_vec.cast_load(smem + (j * bdx + tx) * vec_size);
+    v_vec.cast_load(smem + (j * bdx + tx) * vec_size); // v从shared memory->global memory中
 #pragma unroll
-    for (uint32_t i = 0; i < vec_size; ++i) {
-      st.o[i] = st.o[i] + s[j] * v_vec[i];
+    for (uint32_t i = 0; i < vec_size; ++i) {//每个线程只更新o[0:head_dim]中vec_size个元素
+      st.o[i] = st.o[i] + s[j] * v_vec[i]; //CUDA Core的方式。 s[j]的计算是在compute_qk device function完成的.
     }
   }
 }
@@ -163,17 +163,17 @@ __device__ __forceinline__ void update_local_state(const T* smem, const float* s
  */
 template <uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz>
 __device__ __forceinline__ void sync_state(state_t<vec_size>& st, float* smem, float* smem_md) {
-  if constexpr (bdz > 1) {
-    constexpr uint32_t head_dim = bdx * vec_size;
+  if constexpr (bdz > 1) { //bdz>1时那么replication warp compute qk都只是计算一部分的q head. 因此需要把计算同一个q head的warp之间汇总md值.
+    constexpr uint32_t head_dim = bdx * vec_size; //head_dim=bdx*vec_size
     auto block = cg::this_thread_block();
-    uint32_t tx = threadIdx.x, ty = threadIdx.y, tz = threadIdx.z;
+    uint32_t tx = threadIdx.x, ty = threadIdx.y, tz = threadIdx.z; //tx: thread id; ty: group id; tz:replication id
     st.o.store(smem + (tz * bdy + ty) * head_dim + tx * vec_size);
     smem_md[(tz * bdy + ty) * 2] = st.m;
     smem_md[(tz * bdy + ty) * 2 + 1] = st.d;
     block.sync();
-    st.init();
+    st.init(); //本质是把 local state 存放到 shared memory
 #pragma unroll
-    for (uint32_t j = 0; j < bdz; ++j) {
+    for (uint32_t j = 0; j < bdz; ++j) { //然后遍历bdz个warps 存放到shared memory的local state,然后与自己的local state进行合并.
       float mz = smem_md[(j * bdy + ty) * 2], dz = smem_md[(j * bdy + ty) * 2 + 1];
       vec_t<float, vec_size> oz;
       oz.load(smem + (j * bdy + ty) * head_dim + tx * vec_size);
@@ -302,7 +302,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeQ* __restrict__ q, DTypeKV* _
                   tx * vec_size),
           producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j < chunk_end);
     }
-    cp_async::commit_group();
+    cp_async::commit_group(); // line 296->line 304 作为一个commit_group.
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
       cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
           v_smem + (((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
@@ -312,10 +312,10 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeQ* __restrict__ q, DTypeKV* _
                   tx * vec_size),
           producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j < chunk_end);
     }
-    cp_async::commit_group();
+    cp_async::commit_group(); // line 306->314 作为一个commit group
     producer_kv_idx_base += bdy * bdz * tile_size_per_bdx;
   }
-  //上述会有2*num_stages_smem commit_group 即 k1,v1,k2,v2,....k_{num_stages_smem},v_{num_stages_smem}
+  //上述会有2*num_stages_smem commit_group 即 k1,v1,k2,v2,....k_{num_stages_smem},v_{num_stages_smem} [每一个k和v都是一个tile_size_per_bdx size的cp operation]
 
   // pipelining k/v tiles loading and state updating
   uint32_t consumer_kv_idx_base = chunk_start, stage_idx = 0;
@@ -327,7 +327,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeQ* __restrict__ q, DTypeKV* _
   for (uint32_t iter = 0; iter < ceil_div(kv_chunk_size, tile_size_per_bdx * bdy * bdz); ++iter) { //kv_chunk_size的tokens数
     // compute qk
     cp_async::wait_group<2 * num_stages_smem - 1>(); 
-    //2*num_stages_smem-1 表示最多只有2*num_stages_smem-1个cp异步事务未完成.即保证了line 305 中k1从global memory到shared memory的异步事务一定完成.
+    //2*num_stages_smem-1 表示最多只有2*num_stages_smem-1个cp异步事务未完成.即当iter=0时保证了line 305 中k1从global memory到shared memory的异步事务一定完成.
     // 在计算qk时，需要保证q,k已经到达shared memory或register中,因此需要用line 316保证k1的到达,q已经在line 259中已经到达了.
     block.sync();
     compute_qk<logits_post_hook, pos_encoding_mode, vec_size, bdx, bdy * tile_size_per_bdx>( //tile_size_per_bdx=1
@@ -338,7 +338,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeQ* __restrict__ q, DTypeKV* _
     // load k
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
       cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
-          k_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim + //Very Interesting! 此处采用的是stage_idx原因是这个周期的数据计算完了，说明没有用了，那么in-place copy新的数据即可
+          k_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim + //Very Interesting! 此处采用的是stage_idx原因是这个周期的k数据计算完了，说明没有用了，那么in-place copy新的数据即可
               tx * vec_size,
           k + info.get_kv_elem_offset(
                   producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j, kv_head_idx,
@@ -350,11 +350,11 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeQ* __restrict__ q, DTypeKV* _
     // 【这份代码的逻辑是:先计算该周期的计算，然后拷贝下一个周期的计算数据】.
 
     // update m/d/o state
-    cp_async::wait_group<2 * num_stages_smem - 1>();
+    cp_async::wait_group<2 * num_stages_smem - 1>(); //当iter=0时保证了line306的v1从global memory到shared memory的异步事务一定完成.
     block.sync();
     update_local_state<vec_size, bdx, bdy * tile_size_per_bdx>(
         v_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, s, stage_idx,
-        st_local);
+        st_local); //更新o
     block.sync();
 
     // load v
@@ -367,20 +367,20 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeQ* __restrict__ q, DTypeKV* _
                   tx * vec_size),
           producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j < chunk_end);
     }
-    cp_async::commit_group();
+    cp_async::commit_group(); //与line 349注释的作用一样.
 
     stage_idx = (stage_idx + 1) % num_stages_smem;
     producer_kv_idx_base += tile_size_per_bdx * bdy * bdz;
     consumer_kv_idx_base += tile_size_per_bdx * bdy * bdz;
   }
-  cp_async::wait_group<0>();
+  cp_async::wait_group<0>(); //等候上述所有cp都完成.也意味着部分softmax(qk/根号d)o计算完.
   block.sync();
 
   // sync local state of all warps inside a threadblock
-  sync_state<vec_size, bdx, bdy, bdz>(st_local, reinterpret_cast<float*>(smem), smem_md);
+  sync_state<vec_size, bdx, bdy, bdz>(st_local, reinterpret_cast<float*>(smem), smem_md);//因为block size中有bdz这个replication dim在，因此需要将计算同一个q head的warps的local state再进行汇总.
   st_local.normalize();
 
-  st_local.o.cast_store(o + (kv_chunk_idx * num_qo_heads + qo_head_idx) * head_dim + tx * vec_size);
+  st_local.o.cast_store(o + (kv_chunk_idx * num_qo_heads + qo_head_idx) * head_dim + tx * vec_size); //然后把结果存放到global memory中.
   if (lse != nullptr) {
     lse[kv_chunk_idx * num_qo_heads + qo_head_idx] = st_local.get_lse();
   }
@@ -667,6 +667,7 @@ cudaError_t SingleDecodeWithKVCacheDispatched(DTypeQ* q, DTypeKV* k, DTypeKV* v,
   const float rope_rcp_scale = 1.f / rope_scale;
   const float rope_rcp_theta = 1.f / rope_theta;
   constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeKV), HEAD_DIM / 32UL); //vec_size在qk计算时每个thread负责的部分向量计算的元素数
+  // 非常有意思,这里constexpr的目的是,很多template function里会通过模板传入vec_size这个参数即在编译的时候就已经确认了,那么在运行的时候就会更快一点.
   constexpr uint32_t num_stages_smem = 2U; //预取数据的周期数+1
   constexpr uint32_t bdx = HEAD_DIM / vec_size; //一般是指32即warp_size
   static_assert(bdx <= 32U);

@@ -28,7 +28,7 @@ namespace flashinfer {
 template <size_t vec_size>
 struct state_t {
   /* the weighted sum of v: exp(pre-softmax logit - m) * v / d  */
-  vec_t<float, vec_size> o;
+  vec_t<float, vec_size> o; //因为每个线程都会保存一个o中的部分元素,元素数量为vec_size决定。
   /* maximum value of pre-softmax logits */
   float m;
   /* sum of exp(pre-softmax logits - m) */
