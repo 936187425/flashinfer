@@ -100,14 +100,14 @@ __device__ __forceinline__ void compute_qk(const T* smem, uint32_t compute_stage
     }
 #pragma unroll
     for (uint32_t offset = bdx / 2; offset > 0; offset /= 2) {
-      s[j] += math::shfl_xor_sync(s[j], offset);
-    }//math::shfl_xor_sync是一个warp level primitives,即把一个warp中传入的寄存器s[j]进行求最大值，并把一个warp中的最大值返回给s[j]寄存器中.
+      s[j] += math::shfl_xor_sync(s[j], offset); 
+    }//math::shfl_xor_sync是一个warp level primitives,即把一个warp中传入的寄存器s[j]进行sum，并把一个warp中的最大值返回给s[j]寄存器中.
     s[j] = (iter_base + tz * tile_size + j < iter_bound) ? s[j] : -5e4;
     s[j] = apply_logits_post_hook<logits_post_hook>(s[j], logits_soft_cap);
     if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
       s[j] += alibi_slope * float(int(kv_idx_base + tz * tile_size + j) - q_offset);
     }
-    st.m = max(st.m, s[j]); 
+    st.m = max(st.m, s[j]); //st.m一个warp中是一致的.
   }//此时就计算出一个q与tile_size个k token向量乘结果的最大值.
 
   float o_scale = math::ptx_exp2(m_prev - st.m);
@@ -115,11 +115,11 @@ __device__ __forceinline__ void compute_qk(const T* smem, uint32_t compute_stage
 #pragma unroll
   for (uint32_t j = 0; j < tile_size; ++j) {
     s[j] = math::ptx_exp2(s[j] - st.m);
-    st.d += s[j]; //更新st.d:一共有两部,更新之前算的d(即line:111),然后再加上现在算的.
+    st.d += s[j]; //更新st.d:一共有两部,更新之前算的d(即line:111),然后再加上现在算的. 在一个warp里的线程st.d的值是相同的
   }
 #pragma unroll
   for (uint32_t i = 0; i < vec_size; ++i) {
-    st.o[i] = st.o[i] * o_scale;
+    st.o[i] = st.o[i] * o_scale;// 在一个warp里的线程st.o的值是不相同的只是该线程负责的vec_size那部分.
   }
 }
 
@@ -316,13 +316,13 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeQ* __restrict__ q, DTypeKV* _
     producer_kv_idx_base += bdy * bdz * tile_size_per_bdx;
   }
   //上述会有2*num_stages_smem commit_group 即 k1,v1,k2,v2,....k_{num_stages_smem},v_{num_stages_smem} [每一个k和v都是一个tile_size_per_bdx size的cp operation]
-
+  
   // pipelining k/v tiles loading and state updating
   uint32_t consumer_kv_idx_base = chunk_start, stage_idx = 0;
-  state_t<vec_size> st_local;
+  state_t<vec_size> st_local; //寄存器.
   float s[bdy * tile_size_per_bdx]; //bdy=group size
 
-//flash attention 计算的迭代.
+//flash attention 计算的迭代.每一个迭代会执行三个步骤： compute_qk(计算局部qk[1,vec_size],更新全局m,更新全局d,还原局部o[1,vec_size]))->update_local_state(更新o=qkv[1,vec_size])->
 #pragma unroll 2
   for (uint32_t iter = 0; iter < ceil_div(kv_chunk_size, tile_size_per_bdx * bdy * bdz); ++iter) { //kv_chunk_size的tokens数
     // compute qk
@@ -380,10 +380,12 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeQ* __restrict__ q, DTypeKV* _
   sync_state<vec_size, bdx, bdy, bdz>(st_local, reinterpret_cast<float*>(smem), smem_md);//因为block size中有bdz这个replication dim在，因此需要将计算同一个q head的warps的local state再进行汇总.
   st_local.normalize();
 
-  st_local.o.cast_store(o + (kv_chunk_idx * num_qo_heads + qo_head_idx) * head_dim + tx * vec_size); //然后把结果存放到global memory中.
+  st_local.o.cast_store(o + (kv_chunk_idx * num_qo_heads + qo_head_idx) * head_dim + tx * vec_size); //然后每个线程把各自的vec_size结果存放到global memory中. 
+  //注意这个是store操作，会有bdz个线程往同一个global memory上相同地址store.其实是有(bdz-1)*warp_size重复store操作
   if (lse != nullptr) {
     lse[kv_chunk_idx * num_qo_heads + qo_head_idx] = st_local.get_lse();
   }
+  // line 380->line 387: 线程的local state 有vec_size的o元素，汇总过程:先bdz个线程汇总o[sync_state],然后把寄存器中的o再写回到global memory中.
 }
 
 /*!
